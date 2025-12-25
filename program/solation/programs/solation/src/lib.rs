@@ -166,18 +166,6 @@ pub mod solation {
         instructions::handle_cancel_expired_request(ctx)
     }
 
-    // ===== Legacy User Instructions (Deprecated) =====
-    // Note: create_position is kept for backward compatibility but will be removed
-
-    pub fn create_position(
-        ctx: Context<CreatePosition>,
-        position_id: u64,
-        strike_price: u64,
-        contract_size: u64,
-    ) -> Result<()> {
-        instructions::handle_create_position(ctx, position_id, strike_price, contract_size)
-    }
-
     // ===== Settlement Instructions =====
 
     pub fn settle_position(ctx: Context<SettlePosition>) -> Result<()> {

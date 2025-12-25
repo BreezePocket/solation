@@ -583,7 +583,7 @@ pub struct RejectRequest<'info> {
     pub mm_owner: Signer<'info>,
 }
 
-pub fn handle_reject_request(ctx: Context<RejectRequest>) -> Result<()> {
+pub fn handle_reject_request(_ctx: Context<RejectRequest>) -> Result<()> {
     // The request is closed and rent returned to user
     // Status is implicitly "Rejected" since account is closed
     msg!("Position request rejected by MM");
