@@ -73,4 +73,52 @@ pub enum ErrorCode {
 
     #[msg("Only the market maker can confirm this request")]
     UnauthorizedConfirmation,
+
+    // ===== New errors for off-chain RFQ system =====
+
+    #[msg("Market maker is not registered")]
+    MMNotRegistered,
+
+    #[msg("Market maker is not active in registry")]
+    MMNotActive,
+
+    #[msg("Invalid Ed25519 signature")]
+    InvalidSignature,
+
+    #[msg("Quote nonce has already been used")]
+    NonceAlreadyUsed,
+
+    #[msg("Intent is not in pending status")]
+    IntentNotPending,
+
+    #[msg("Intent has not expired yet")]
+    IntentNotExpired,
+
+    #[msg("Intent has already expired")]
+    IntentExpired,
+
+    #[msg("Intent is not in a resolvable status")]
+    IntentNotResolvable,
+
+    #[msg("Intent is already disputed")]
+    IntentAlreadyDisputed,
+
+    #[msg("Only user or market maker can flag dispute")]
+    UnauthorizedDispute,
+
+    #[msg("Invalid percentage value")]
+    InvalidPercentage,
+
+    #[msg("Dispute reason too long")]
+    DisputeReasonTooLong,
+
+    #[msg("Only the designated market maker can fill this intent")]
+    UnauthorizedFill,
+
+    #[msg("Signing key mismatch")]
+    SigningKeyMismatch,
+
+    #[msg("Invalid vault address")]
+    InvalidVault,
 }
+

@@ -4,11 +4,12 @@ pub mod constants;
 pub mod errors;
 pub mod instructions;
 pub mod state;
+pub mod utils;
 
 use instructions::*;
 use state::*;
 
-declare_id!("2KW4NXTSbeq5BJM39rsR1sR15Uf72perBkVVMH88ZGRm");
+declare_id!("4XkfZ5hHr43pSZBioix3ps8Y8UR1ghN6fjP1zccEFYXQ");
 
 #[program]
 pub mod solation {
@@ -81,92 +82,94 @@ pub mod solation {
         )
     }
 
-    // ===== Market Maker Instructions =====
+    // ===== Market Maker Registration (Off-Chain RFQ) =====
 
-    pub fn register_market_maker(ctx: Context<RegisterMarketMaker>) -> Result<()> {
-        instructions::handle_register_market_maker(ctx)
+    /// MM registers with their Ed25519 signing key
+    pub fn register_mm(ctx: Context<RegisterMM>, signing_key: Pubkey) -> Result<()> {
+        instructions::handle_register_mm(ctx, signing_key)
     }
 
-    pub fn initialize_vault(ctx: Context<InitializeVault>, asset_mint: Pubkey) -> Result<()> {
-        instructions::handle_initialize_vault(ctx, asset_mint)
-    }
-
-    pub fn deposit_liquidity(ctx: Context<DepositLiquidity>, amount: u64) -> Result<()> {
-        instructions::handle_deposit_liquidity(ctx, amount)
-    }
-
-    pub fn withdraw_liquidity(ctx: Context<WithdrawLiquidity>, amount: u64) -> Result<()> {
-        instructions::handle_withdraw_liquidity(ctx, amount)
-    }
-
-    pub fn submit_quote(
-        ctx: Context<SubmitQuote>,
-        asset_mint: Pubkey,
-        quote_mint: Pubkey,
-        strategy: StrategyType,
-        strikes: Vec<StrikeQuote>,
-        expiry_timestamp: i64,
-        min_size: u64,
-        max_size: u64,
+    /// MM updates their signing key
+    pub fn update_mm_signing_key(
+        ctx: Context<UpdateMMSigningKey>,
+        new_signing_key: Pubkey,
     ) -> Result<()> {
-        instructions::handle_submit_quote(
-            ctx,
-            asset_mint,
-            quote_mint,
-            strategy,
-            strikes,
-            expiry_timestamp,
-            min_size,
-            max_size,
-        )
+        instructions::handle_update_mm_signing_key(ctx, new_signing_key)
     }
 
-    pub fn update_quote(
-        ctx: Context<UpdateQuote>,
-        strikes: Option<Vec<StrikeQuote>>,
-        expiry_timestamp: Option<i64>,
-        min_size: Option<u64>,
-        max_size: Option<u64>,
-        active: Option<bool>,
+    // ===== Intent Lifecycle (Off-Chain RFQ) =====
+
+    /// User submits intent with MM's signed quote
+    pub fn submit_intent(ctx: Context<SubmitIntent>, params: SubmitIntentParams) -> Result<()> {
+        instructions::handle_submit_intent(ctx, params)
+    }
+
+    /// MM fills the intent (creates Position, pays premium)
+    pub fn fill_intent(ctx: Context<FillIntent>) -> Result<()> {
+        instructions::handle_fill_intent(ctx)
+    }
+
+    /// User cancels unfilled intent (reclaims escrow)
+    pub fn cancel_intent(ctx: Context<CancelIntent>) -> Result<()> {
+        instructions::handle_cancel_intent(ctx)
+    }
+
+    /// Anyone can cleanup expired intents
+    pub fn expire_intent(ctx: Context<ExpireIntent>) -> Result<()> {
+        instructions::handle_expire_intent(ctx)
+    }
+
+    /// User or MM flags intent for dispute
+    pub fn flag_dispute(ctx: Context<FlagDispute>, reason: String) -> Result<()> {
+        instructions::handle_flag_dispute(ctx, reason)
+    }
+
+    // ===== Dispute Resolution (Owner Override) =====
+
+    /// 1. MUTUAL_UNWIND: Return all funds to original parties
+    pub fn mutual_unwind(ctx: Context<MutualUnwindIntent>, reason: String) -> Result<()> {
+        instructions::handle_mutual_unwind(ctx, reason)
+    }
+
+    /// 2. FORCE_CONTINUE: Force-create position as if MM had filled
+    pub fn force_continue(
+        ctx: Context<ForceContinueIntent>,
+        reason: String,
+        pay_premium: bool,
     ) -> Result<()> {
-        instructions::handle_update_quote(
-            ctx,
-            strikes,
-            expiry_timestamp,
-            min_size,
-            max_size,
-            active,
-        )
+        instructions::handle_force_continue(ctx, reason, pay_premium)
     }
 
-    // ===== Position Request Instructions (Two-Phase Commit) =====
-
-    /// User requests a position - creates pending request for MM to approve
-    pub fn request_position(
-        ctx: Context<RequestPosition>,
-        request_id: u64,
-        strike_price: u64,
-        contract_size: u64,
+    /// 3. FORCE_SETTLE_NOW: Settle immediately at specified price/split
+    pub fn force_settle_now(
+        ctx: Context<ForceSettleNowIntent>,
+        settlement_price: u64,
+        user_payout_bps: u16,
+        reason: String,
     ) -> Result<()> {
-        instructions::handle_request_position(ctx, request_id, strike_price, contract_size)
+        instructions::handle_force_settle_now(ctx, settlement_price, user_payout_bps, reason)
     }
 
-    /// MM confirms the request within 30 seconds - locks collateral and pays premium
-    pub fn confirm_position(ctx: Context<ConfirmPosition>, position_id: u64) -> Result<()> {
-        instructions::handle_confirm_position(ctx, position_id)
+    /// 4. ESCROW_TO_TREASURY: Move funds to treasury for manual distribution
+    pub fn escrow_to_treasury(ctx: Context<EscrowToTreasuryIntent>, reason: String) -> Result<()> {
+        instructions::handle_escrow_to_treasury(ctx, reason)
     }
 
-    /// MM explicitly rejects the request
-    pub fn reject_request(ctx: Context<RejectRequest>) -> Result<()> {
-        instructions::handle_reject_request(ctx)
+    /// 5. PROPORTIONAL_SPLIT: Split escrow by percentage
+    pub fn proportional_split(
+        ctx: Context<ProportionalSplitIntent>,
+        user_bps: u16,
+        reason: String,
+    ) -> Result<()> {
+        instructions::handle_proportional_split(ctx, user_bps, reason)
     }
 
-    /// Anyone can cancel expired requests (after 30s timeout)
-    pub fn cancel_expired_request(ctx: Context<CancelExpiredRequest>) -> Result<()> {
-        instructions::handle_cancel_expired_request(ctx)
+    /// 6. EMERGENCY_SHUTDOWN: Global pause, prepare for mass unwind
+    pub fn emergency_shutdown(ctx: Context<TriggerEmergencyShutdown>, reason: String) -> Result<()> {
+        instructions::handle_emergency_shutdown(ctx, reason)
     }
 
-    // ===== Settlement Instructions =====
+    // ===== Settlement =====
 
     pub fn settle_position(ctx: Context<SettlePosition>) -> Result<()> {
         instructions::handle_settle_position(ctx)

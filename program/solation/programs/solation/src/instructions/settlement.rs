@@ -5,9 +5,12 @@ use crate::state::*;
 use crate::constants::*;
 use crate::errors::ErrorCode;
 
-// Settle position
+/// Settle a position at expiry using Pyth oracle price
 #[derive(Accounts)]
 pub struct SettlePosition<'info> {
+    /// Anyone can call settle (permissionless settlement)
+    pub settler: Signer<'info>,
+
     #[account(
         mut,
         constraint = position.status == PositionStatus::Active @ ErrorCode::PositionNotActive
@@ -20,52 +23,54 @@ pub struct SettlePosition<'info> {
     )]
     pub asset_config: Account<'info, AssetConfig>,
 
+    /// MM's registry (for stats tracking)
     #[account(
         mut,
-        seeds = [MARKET_MAKER_SEED, market_maker.owner.as_ref()],
-        bump = market_maker.bump
+        seeds = [MM_REGISTRY_SEED, position.market_maker.as_ref()],
+        bump = mm_registry.bump
     )]
-    pub market_maker: Account<'info, MarketMaker>,
+    pub mm_registry: Account<'info, MMRegistry>,
 
-    // Position vaults
+    /// Position's user vault (user's locked collateral)
     #[account(
         mut,
-        token::authority = position_vault_authority
+        constraint = position_user_vault.key() == position.user_vault @ ErrorCode::InvalidVault
     )]
     pub position_user_vault: Account<'info, TokenAccount>,
 
-    #[account(
-        mut,
-        token::authority = position_vault_authority
-    )]
+    /// Position's MM vault (MM's locked collateral if any)
+    #[account(mut)]
     pub position_mm_vault: Account<'info, TokenAccount>,
 
-    /// CHECK: PDA authority for position vaults (derived with position_id)
-    pub position_vault_authority: AccountInfo<'info>,
+    /// CHECK: PDA authority for position vaults
+    #[account(
+        seeds = [POSITION_SEED, position.user.as_ref(), &position.position_id.to_le_bytes()],
+        bump = position.bump
+    )]
+    pub position_authority: AccountInfo<'info>,
 
-    // Market maker's vault (to unlock liquidity)
+    /// User's destination token account
     #[account(
         mut,
-        seeds = [MM_VAULT_SEED, market_maker.key().as_ref(), mm_vault.asset_mint.as_ref()],
-        bump = mm_vault.bump
+        constraint = user_destination.owner == position.user
     )]
-    pub mm_vault: Account<'info, MarketMakerVault>,
-
-    // Destination accounts for settlement
-    #[account(mut)]
     pub user_destination: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    /// MM's destination token account  
+    #[account(
+        mut,
+        constraint = mm_destination.owner == position.market_maker
+    )]
     pub mm_destination: Account<'info, TokenAccount>,
 
-    // Pyth price feed
+    /// Pyth price feed
     /// CHECK: Validated by Pyth SDK
     pub price_update: AccountInfo<'info>,
 
     pub token_program: Program<'info, Token>,
 }
 
-pub fn handle_settle_position(mut ctx: Context<SettlePosition>) -> Result<()> {
+pub fn handle_settle_position(ctx: Context<SettlePosition>) -> Result<()> {
     let clock = Clock::get()?;
 
     // Check position has expired
@@ -74,277 +79,157 @@ pub fn handle_settle_position(mut ctx: Context<SettlePosition>) -> Result<()> {
         ErrorCode::PositionNotExpired
     );
 
-    // Load Pyth price update and extract settlement price
-    let settlement_price = {
-        let price_update_account = &ctx.accounts.price_update;
-        let price_update_data = price_update_account.try_borrow_data()
-            .map_err(|_| ErrorCode::PriceTooStale)?;
-
-        let price_update = PriceUpdateV2::try_from_slice(&price_update_data)
-            .map_err(|_| ErrorCode::PriceTooStale)?;
-
-        // Get price with staleness check
-        // Note: Pyth SDK v1.x uses get_price_unchecked
-        let price = price_update.get_price_unchecked(&ctx.accounts.asset_config.pyth_feed_id)
-            .map_err(|_| ErrorCode::PythFeedIdMismatch)?;
-
-        // Manual staleness check
-        let price_timestamp = price_update.price_message.publish_time;
-        require!(
-            clock.unix_timestamp - price_timestamp < PYTH_STALENESS_THRESHOLD as i64,
-            ErrorCode::PriceTooStale
-        );
-
-        // Verify feed ID matches
-        require!(
-            price_update.price_message.feed_id == ctx.accounts.asset_config.pyth_feed_id,
-            ErrorCode::PythFeedIdMismatch
-        );
-
-        // Convert price to u64 (handle negative prices by taking absolute value)
-        price.price.abs() as u64
-    };
+    // Load Pyth price and validate
+    let settlement_price = get_pyth_price(
+        &ctx.accounts.price_update,
+        &ctx.accounts.asset_config.pyth_feed_id,
+        clock.unix_timestamp,
+    )?;
 
     msg!("Settlement price: {}", settlement_price);
     msg!("Strike price: {}", ctx.accounts.position.strike_price);
 
-    // Store settlement price and strategy before borrowing ctx mutably
-    ctx.accounts.position.settlement_price = Some(settlement_price);
-    let strategy = ctx.accounts.position.strategy;
-    let position_key = ctx.accounts.position.key();
+    // Store settlement price
+    let position = &mut ctx.accounts.position;
+    position.settlement_price = Some(settlement_price);
 
-    // Settle based on strategy
+    let strike_price = position.strike_price;
+    let contract_size = position.contract_size;
+    let strategy = position.strategy;
+
+    // Calculate payout based on strategy and ITM/OTM
+    let (user_amount, mm_amount, status) = calculate_settlement(
+        strategy,
+        settlement_price,
+        strike_price,
+        contract_size,
+        ctx.accounts.position_user_vault.amount,
+    );
+
+    // Prepare PDA signer
+    let position_seeds = &[
+        POSITION_SEED,
+        position.user.as_ref(),
+        &position.position_id.to_le_bytes(),
+        &[position.bump],
+    ];
+    let signer = &[&position_seeds[..]];
+
+    // Transfer user's share
+    if user_amount > 0 {
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.position_user_vault.to_account_info(),
+            to: ctx.accounts.user_destination.to_account_info(),
+            authority: ctx.accounts.position_authority.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+                signer,
+            ),
+            user_amount,
+        )?;
+    }
+
+    // Transfer MM's share
+    if mm_amount > 0 {
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.position_user_vault.to_account_info(),
+            to: ctx.accounts.mm_destination.to_account_info(),
+            authority: ctx.accounts.position_authority.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                cpi_accounts,
+                signer,
+            ),
+            mm_amount,
+        )?;
+    }
+
+    // Update position status
+    let position = &mut ctx.accounts.position;
+    position.status = status;
+
+    // Update MM stats
+    let mm_registry = &mut ctx.accounts.mm_registry;
+    mm_registry.total_intents_filled = mm_registry.total_intents_filled.saturating_add(1);
+
+    msg!("Position {} settled. User: {}, MM: {}", 
+         position.position_id, user_amount, mm_amount);
+
+    Ok(())
+}
+
+/// Get Pyth price with validation
+fn get_pyth_price(
+    price_update_account: &AccountInfo,
+    expected_feed_id: &[u8; 32],
+    current_timestamp: i64,
+) -> Result<u64> {
+    let price_update_data = price_update_account.try_borrow_data()
+        .map_err(|_| ErrorCode::PriceTooStale)?;
+
+    let price_update = PriceUpdateV2::try_from_slice(&price_update_data)
+        .map_err(|_| ErrorCode::PriceTooStale)?;
+
+    // Get price
+    let price = price_update.get_price_unchecked(expected_feed_id)
+        .map_err(|_| ErrorCode::PythFeedIdMismatch)?;
+
+    // Staleness check
+    let price_timestamp = price_update.price_message.publish_time;
+    require!(
+        current_timestamp - price_timestamp < PYTH_STALENESS_THRESHOLD as i64,
+        ErrorCode::PriceTooStale
+    );
+
+    // Verify feed ID
+    require!(
+        price_update.price_message.feed_id == *expected_feed_id,
+        ErrorCode::PythFeedIdMismatch
+    );
+
+    // Convert to u64 (handle negative prices)
+    Ok(price.price.unsigned_abs())
+}
+
+/// Calculate settlement amounts based on strategy
+fn calculate_settlement(
+    strategy: StrategyType,
+    settlement_price: u64,
+    strike_price: u64,
+    _contract_size: u64,
+    vault_amount: u64,
+) -> (u64, u64, PositionStatus) {
     match strategy {
         StrategyType::CoveredCall => {
-            settle_covered_call(&mut ctx, settlement_price)?;
+            if settlement_price > strike_price {
+                // ITM: MM exercises, gets the difference value
+                // User gets strike price worth
+                // MM gets the rest (upside)
+                let strike_value = vault_amount.saturating_mul(strike_price) / settlement_price;
+                let mm_gain = vault_amount.saturating_sub(strike_value);
+                (strike_value, mm_gain, PositionStatus::SettledITM)
+            } else {
+                // OTM: Expires worthless, user keeps collateral, MM keeps premium
+                (vault_amount, 0, PositionStatus::SettledOTM)
+            }
         }
         StrategyType::CashSecuredPut => {
-            settle_cash_secured_put(&mut ctx, settlement_price)?;
+            if settlement_price < strike_price {
+                // ITM: User must buy at strike, MM delivers asset value
+                // MM gets the collateral (user's USDC at strike)
+                // User gets underlying value worth of USDC
+                let user_value = vault_amount.saturating_mul(settlement_price) / strike_price;
+                let mm_gain = vault_amount.saturating_sub(user_value);
+                (user_value, mm_gain, PositionStatus::SettledITM)
+            } else {
+                // OTM: Expires worthless, user keeps USDC, MM keeps premium
+                (vault_amount, 0, PositionStatus::SettledOTM)
+            }
         }
     }
-
-    msg!("Position settled: {}", position_key);
-
-    Ok(())
-}
-
-fn settle_covered_call(
-    ctx: &mut Context<SettlePosition>,
-    settlement_price: u64,
-) -> Result<()> {
-    // Extract position data before any mutable borrows
-    let position_bump = ctx.accounts.position.bump;
-    let position_user = ctx.accounts.position.user;
-    let position_id = ctx.accounts.position.position_id;
-    let contract_size = ctx.accounts.position.contract_size;
-    let strike_price = ctx.accounts.position.strike_price;
-
-    let position_seeds = &[
-        POSITION_SEED,
-        position_user.as_ref(),
-        &position_id.to_le_bytes(),
-        &[position_bump],
-    ];
-    let signer = &[&position_seeds[..]];
-
-
-    if settlement_price > strike_price {
-        // ITM: MM exercises
-        ctx.accounts.position.status = PositionStatus::SettledITM;
-
-        // Transfer underlying from position_user_vault to MM
-        let cpi_accounts_underlying = Transfer {
-            from: ctx.accounts.position_user_vault.to_account_info(),
-            to: ctx.accounts.mm_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_underlying,
-                signer,
-            ),
-            contract_size,
-        )?;
-
-        // Transfer USDC from position_mm_vault to user
-        let cpi_accounts_usdc = Transfer {
-            from: ctx.accounts.position_mm_vault.to_account_info(),
-            to: ctx.accounts.user_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_usdc,
-                signer,
-            ),
-            ctx.accounts.position_mm_vault.amount,
-        )?;
-
-        msg!("Covered call settled ITM - MM exercised");
-    } else {
-        // OTM: Expires worthless
-        ctx.accounts.position.status = PositionStatus::SettledOTM;
-
-        // Transfer underlying back to user
-        let cpi_accounts_underlying = Transfer {
-            from: ctx.accounts.position_user_vault.to_account_info(),
-            to: ctx.accounts.user_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_underlying,
-                signer,
-            ),
-            contract_size,
-        )?;
-
-        // Transfer USDC back to MM
-        let cpi_accounts_usdc = Transfer {
-            from: ctx.accounts.position_mm_vault.to_account_info(),
-            to: ctx.accounts.mm_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_usdc,
-                signer,
-            ),
-            ctx.accounts.position_mm_vault.amount,
-        )?;
-
-        msg!("Covered call settled OTM - User keeps underlying");
-    }
-
-    // Update market maker stats
-    let market_maker = &mut ctx.accounts.market_maker;
-    market_maker.completed_positions = market_maker
-        .completed_positions
-        .checked_add(1)
-        .ok_or(ErrorCode::MathOverflow)?;
-
-    // Unlock MM vault liquidity
-    let mm_vault = &mut ctx.accounts.mm_vault;
-    let strike_amount = strike_price
-        .checked_mul(contract_size)
-        .ok_or(ErrorCode::MathOverflow)?;
-
-    mm_vault.locked_liquidity = mm_vault
-        .locked_liquidity
-        .checked_sub(strike_amount)
-        .ok_or(ErrorCode::MathOverflow)?;
-
-    Ok(())
-}
-
-fn settle_cash_secured_put(
-    ctx: &mut Context<SettlePosition>,
-    settlement_price: u64,
-) -> Result<()> {
-    // Extract position data before any mutable borrows
-    let position_bump = ctx.accounts.position.bump;
-    let position_user = ctx.accounts.position.user;
-    let position_id = ctx.accounts.position.position_id;
-    let contract_size = ctx.accounts.position.contract_size;
-    let strike_price = ctx.accounts.position.strike_price;
-
-    let position_seeds = &[
-        POSITION_SEED,
-        position_user.as_ref(),
-        &position_id.to_le_bytes(),
-        &[position_bump],
-    ];
-    let signer = &[&position_seeds[..]];
-
-    if settlement_price < strike_price {
-        // ITM: User exercises
-        ctx.accounts.position.status = PositionStatus::SettledITM;
-
-        // Transfer underlying from position_mm_vault to user
-        let cpi_accounts_underlying = Transfer {
-            from: ctx.accounts.position_mm_vault.to_account_info(),
-            to: ctx.accounts.user_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_underlying,
-                signer,
-            ),
-            contract_size,
-        )?;
-
-        // Transfer USDC from position_user_vault to MM
-        let cpi_accounts_usdc = Transfer {
-            from: ctx.accounts.position_user_vault.to_account_info(),
-            to: ctx.accounts.mm_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_usdc,
-                signer,
-            ),
-            ctx.accounts.position_user_vault.amount,
-        )?;
-
-        msg!("Cash secured put settled ITM - User exercised");
-    } else {
-        // OTM: Expires worthless
-        ctx.accounts.position.status = PositionStatus::SettledOTM;
-
-        // Transfer USDC back to user
-        let cpi_accounts_usdc = Transfer {
-            from: ctx.accounts.position_user_vault.to_account_info(),
-            to: ctx.accounts.user_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_usdc,
-                signer,
-            ),
-            ctx.accounts.position_user_vault.amount,
-        )?;
-
-        // Transfer underlying back to MM
-        let cpi_accounts_underlying = Transfer {
-            from: ctx.accounts.position_mm_vault.to_account_info(),
-            to: ctx.accounts.mm_destination.to_account_info(),
-            authority: ctx.accounts.position_vault_authority.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts_underlying,
-                signer,
-            ),
-            contract_size,
-        )?;
-
-        msg!("Cash secured put settled OTM - User gets USDC back");
-    }
-
-    // Update market maker stats
-    let market_maker = &mut ctx.accounts.market_maker;
-    market_maker.completed_positions = market_maker
-        .completed_positions
-        .checked_add(1)
-        .ok_or(ErrorCode::MathOverflow)?;
-
-    // Unlock MM vault liquidity
-    let mm_vault = &mut ctx.accounts.mm_vault;
-    mm_vault.locked_liquidity = mm_vault
-        .locked_liquidity
-        .checked_sub(contract_size)
-        .ok_or(ErrorCode::MathOverflow)?;
-
-    Ok(())
 }

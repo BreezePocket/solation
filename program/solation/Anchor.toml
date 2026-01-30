@@ -1,24 +1,24 @@
 [toolchain]
 
 [features]
-seeds = false
+resolution = true
 skip-lint = false
 
 [programs.localnet]
-solation = "2KW4NXTSbeq5BJM39rsR1sR15Uf72perBkVVMH88ZGRm"
+solation = "4XkfZ5hHr43pSZBioix3ps8Y8UR1ghN6fjP1zccEFYXQ"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
-wallet = "/home/skyyap/.config/solana/id.json"
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
 init-01 = "ts-node scripts/01-init-global-state.ts"
 init-02 = "ts-node scripts/02-add-assets.ts"
 init-03 = "ts-node scripts/03-register-market-maker.ts"
 init-04 = "ts-node scripts/04-init-vaults.ts"
 init-05 = "ts-node scripts/05-deposit-liquidity.ts"
 init-06 = "ts-node scripts/06-submit-quotes.ts"
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
