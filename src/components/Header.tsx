@@ -16,27 +16,25 @@ export const Header: React.FC = () => {
           {/* Left: Navigation */}
           <nav className="flex items-center space-x-8">
             <Link to="/" className="text-xl font-bold text-retro-green">
-              SOLATION
+              BREEZEPOCKET
             </Link>
 
             <div className="flex space-x-6">
               <Link
                 to="/earn"
-                className={`font-medium transition-colors ${
-                  isActive('/earn') || isActive('/') || location.pathname.startsWith('/trade')
+                className={`font-medium transition-colors ${isActive('/earn') || isActive('/') || location.pathname.startsWith('/trade')
                     ? 'text-retro-green'
                     : 'text-retro-gray-600 hover:text-retro-black'
-                }`}
+                  }`}
               >
                 Earn
               </Link>
               <Link
                 to="/dashboard"
-                className={`font-medium transition-colors ${
-                  isActive('/dashboard')
+                className={`font-medium transition-colors ${isActive('/dashboard')
                     ? 'text-retro-green'
                     : 'text-retro-gray-600 hover:text-retro-black'
-                }`}
+                  }`}
               >
                 Dashboard
               </Link>

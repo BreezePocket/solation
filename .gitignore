@@ -29,3 +29,4 @@ INTEGRATION_COMPLETE.md
 INTEGRATION_GUIDE.md
 QUICK_START.md
 .claude/settings.local.json
+backend/.env

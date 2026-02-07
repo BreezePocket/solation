@@ -1,4 +1,4 @@
-# Solation - Earn Upfront Premiums on Your Crypto
+# BreezePocket - Earn Upfront Premiums on Your Crypto
 
 A beautiful, retro-styled decentralized finance (DeFi) options trading interface built with React, TypeScript, and Solana Wallet Adapter.
 
@@ -51,7 +51,7 @@ npm run build
 ## Project Structure
 
 ```
-solation/
+breezepocket/
 ├── src/
 │   ├── components/      # Reusable components
 │   │   └── Header.tsx   # Navigation header with wallet connect
